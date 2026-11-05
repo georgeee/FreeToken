@@ -135,7 +135,7 @@ class SWARadixCache:
         return SWAMatch(kv, int(kv.numel()), best_node)
 
     def insert(self, input_ids: torch.Tensor, kv_indices: torch.Tensor,
-               swa_evicted_seqlen: int = 0, update_kv_after_len: int = 0
+               swa_evicted_seqlen: int = 0, update_kv_after_len: int = 0, reading: bool = False
                ) -> Tuple[int, torch.Tensor]:
         """Insert the committed full KV prefix. ``kv_indices`` are the request's full-pool page
         indices (the swa rides along via the full->swa mapping, live where the request allocated
@@ -146,6 +146,10 @@ class SWARadixCache:
           it are tree-shared slots and are left untouched.
         - ``swa_evicted_seqlen`` (= positions whose swa the request itself freed during decode):
           below it the request's swa is the sentinel; at/above it it is live.
+
+        ``reading`` (an unfinished commit: the request keeps decoding from its row) stops the
+        insert at a full-locked tombstone inside the request's trailing window; the rest stays
+        the request's own until a later commit.
 
         A matched node that is ``swa_tombstone`` (swa freed by an earlier ``evict_swa``) and extends
         into the fresh region is REVIVED -- not by rewriting the mapping but by adopting the
@@ -160,6 +164,7 @@ class SWARadixCache:
         freed: List[torch.Tensor] = []
         node = self.root
         total = 0
+        stopped = False
         while total < insert_len:
             child = node.children.get(self.key_fn(input_ids[total:]))
             if child is None:
@@ -175,6 +180,11 @@ class SWARadixCache:
                 if child.swa_tombstone:
                     assert child.swa_ref_count == 0, "a tombstoned node cannot hold a swa lock"
                     if child.ref_count > 0:
+                        if reading and total + match_len > insert_len - self.sliding_window_size:
+                            # In the reader's own window the re-match cannot pass this tombstone,
+                            # so its row would keep naming the dup freed below: leave the rest.
+                            stopped = True
+                            break
                         # A full-locked reader still gathers the node's CURRENT slots through its
                         # own row; freeing them on revive would hand live KV to the next alloc.
                         # Keep the tombstone + the tree's value, drop the request's dup (Branch 3
@@ -214,7 +224,7 @@ class SWARadixCache:
         # Suffix: tokens [total:insert_len) not yet in the tree. Tombstone [total, swa_evicted_seqlen),
         # then a live (non-tombstone) leaf for the in-window remainder (never a tombstone leaf --
         # the clamp + the free_swa -page_size margin guarantee a live tail).
-        if total < insert_len:
+        if total < insert_len and not stopped:
             # Both suffix nodes can share this copy without retaining the request buffer.
             suffix_ids = input_ids[total:].clone()
             suffix_kv = kv_indices[total:].clone()

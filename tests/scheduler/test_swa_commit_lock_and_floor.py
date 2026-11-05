@@ -82,13 +82,13 @@ def _managers(window: int, num_swa_tokens: int, ps: int = 1, num_pages: int = 40
     return cm, tm, PrefillManager(cm, tm, DecodeManager(page_size=ps))
 
 
-def _prefill(cm, pm, prompt_len: int, n_decode: int, base: int = 1):
+def _prefill(cm, pm, prompt_len: int, n_decode: int, base: int = 1, ids=None):
     """Real chunked prefill (chunk sizes from PrefillAdder) in the scheduler's overlap order:
     schedule+forward chunk N+1 before committing chunk N; only the final chunk commits.
-    ``base`` shifts the token ids so concurrent requests share no prefix."""
-    pm.pending_list = [PendingReq(uid=UID,
-                                  input_ids=torch.arange(base, base + prompt_len,
-                                                         dtype=torch.int32),
+    ``base`` shifts the token ids so concurrent requests share no prefix; ``ids`` overrides them."""
+    if ids is None:
+        ids = torch.arange(base, base + prompt_len, dtype=torch.int32)
+    pm.pending_list = [PendingReq(uid=UID, input_ids=ids,
                                   sampling_params=SamplingParams(max_tokens=n_decode))]
     final = last_batch = None
     while pm.runnable or last_batch is not None:
@@ -170,6 +170,39 @@ def test_short_final_chunk_locks_no_more_than_a_window(monkeypatch):
         cm.cache_req(req, finished=True)
         tm.free(req.table_idx)
         cm.check_integrity()
+
+
+@pytest.mark.parametrize("concurrent", [True, False])
+@pytest.mark.parametrize("suffix", [0, 1, 3, 7, 8, 30])
+@pytest.mark.parametrize("prefix", [40, 64])
+def test_short_suffix_commit_over_a_locked_tombstone(prefix, suffix, concurrent, monkeypatch):
+    """C = X + a suffix shorter than the window commits while A still locks the shared prefix X
+    and B's finish has trimmed X's swa to a tombstone. insert keeps the tombstone and returns C's
+    slots for X as duplicates, but match_prefix cannot reuse X (C's trailing window reaches into
+    it), so C's row is not re-pointed: those slots must stay C's, not go back to the pool."""
+    monkeypatch.setattr(cache_mod, "_SWA_EVICTION_INTERVAL", 1)
+    window = 8
+    cm, tm, pm = _managers(window, num_swa_tokens=4096 + 1, num_pages=8192, width=4096)
+    x = torch.arange(1, prefix + 1, dtype=torch.int32)
+
+    def run(tail_base, tail_len):
+        tail = torch.arange(tail_base, tail_base + tail_len, dtype=torch.int32)
+        return _prefill(cm, pm, prefix + tail_len, 1000, ids=torch.cat([x, tail]))
+
+    live = [run(10_000, 30)] if concurrent else []
+    b = run(20_000, 40)
+    _decode(cm, live + [b], 3)
+    cm.cache_req(b, finished=True)
+    tm.free(b.table_idx)
+    c = run(30_000, suffix)
+    row = cm.page_table[c.table_idx, : c.cached_len]
+    assert not torch.isin(row, cm.free_slots).any(), "C's row names slots already freed"
+    live.append(c)
+    _decode(cm, live, 3 * window)
+    for r in live:
+        cm.cache_req(r, finished=True)
+        tm.free(r.table_idx)
+    cm.check_integrity()
 
 
 # --------------------------------------------------------------- what that buys at runtime
